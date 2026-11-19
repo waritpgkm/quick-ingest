@@ -51,11 +51,15 @@ def assign_sequence_names(files: list[Path], destination: Path, prefix: str, dig
 
 
 def load_manifest(destination: Path) -> dict[str, str]:
-    """Return the recorded source-name/size to destination-name map; corrupt or absent history reads as empty."""
+    """Return the recorded source-filename to destination-name map; corrupt or absent history reads as empty."""
     try:
-        return json.loads((destination / MANIFEST_FILE).read_text(encoding="utf-8"))
+        entries = json.loads((destination / MANIFEST_FILE).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+    if not isinstance(entries, dict):
+        return {}
+    # older builds keyed entries as "name|size"; filenames cannot contain "|" on Windows
+    return {key.rsplit("|", 1)[0]: value for key, value in entries.items()}
 
 
 def save_manifest(destination: Path, entries: dict[str, str]) -> None:
@@ -66,24 +70,21 @@ def save_manifest(destination: Path, entries: dict[str, str]) -> None:
 
 
 def new_photos(files: list[Path], destination: Path) -> list[Path]:
-    """Drop files the destination already has: by filename, or by manifest entry whose copy still matches."""
+    """Drop files the destination already has, by filename alone."""
+    # shortcut: identity = filename only (sizes change when photos are cropped), upgrade to a content hash if same-named files across folders must be told apart
     try:
-        dest_sizes = {item.name: item.stat().st_size for item in destination.iterdir()}
+        dest_names = {item.name for item in destination.iterdir()}
     except OSError:
-        dest_sizes = {}
+        dest_names = set()
     manifest = load_manifest(destination)
 
     kept = []
     for source in files:
-        try:
-            size = source.stat().st_size
-        except OSError:
-            continue  # vanished mid-scan
-        if source.name in dest_sizes:
+        if source.name in dest_names:
             continue  # original filename already in the destination
-        target = manifest.get(f"{source.name}|{size}")
-        if target is not None and dest_sizes.get(target) == size:
-            continue  # renamed copy still present with matching size
+        target = manifest.get(source.name)
+        if target is not None and target in dest_names:
+            continue  # renamed copy still present
         kept.append(source)
     return kept
 
@@ -130,7 +131,7 @@ def copy_files(
             else:
                 copied += 1
                 status = "COPIED"
-                copied_entries[f"{source.name}|{source_size}"] = name
+                copied_entries[source.name] = name
 
         except FileExistsError:
             skipped += 1
