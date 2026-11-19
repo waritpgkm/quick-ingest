@@ -61,6 +61,9 @@ class QuickIngestWindow(QMainWindow):
         self.scanned_files: list[Path] = []
         self.scan_thread = None
         self.ingest_thread = None
+        self._busy = False
+        self._auto_pending = False
+        self._known_drives: set[str] = set()
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -100,6 +103,8 @@ class QuickIngestWindow(QMainWindow):
         self.protected_check = QCheckBox("Protected files only")
         self.protected_check.setChecked(True)
         options_form.addRow("Selection", self.protected_check)
+        self.auto_check = QCheckBox("Auto ingest when a card is inserted")
+        options_form.addRow("Auto", self.auto_check)
         layout.addWidget(options_group)
 
         destination_group = QGroupBox("Destination")
@@ -118,7 +123,7 @@ class QuickIngestWindow(QMainWindow):
         self.scan_button.clicked.connect(self.scan_source)
         self.ingest_button = QPushButton("Start ingest")
         self.ingest_button.setEnabled(False)
-        self.ingest_button.clicked.connect(self.start_ingest)
+        self.ingest_button.clicked.connect(lambda: self.start_ingest())
         actions.addWidget(self.scan_button)
         actions.addStretch(1)
         actions.addWidget(self.ingest_button)
@@ -175,6 +180,22 @@ class QuickIngestWindow(QMainWindow):
             self.card_status.setText("No camera card found. Insert a card containing DCIM.")
         self.scan_button.setEnabled(bool(self.cards))
 
+        current = {str(card["drive"]) for card in self.cards}
+        new_drives = current - self._known_drives
+        # shortcut: insertion noticed on the 2.5s drive poll (max ~2.5s late), upgrade to WM_DEVICECHANGE if that latency matters
+        if new_drives and self.auto_check.isChecked() and not self._busy:
+            self._known_drives = current
+            for index, card in enumerate(self.cards):
+                if str(card["drive"]) in new_drives:
+                    self.source_combo.setCurrentIndex(index)
+                    break
+            self.append_log(f"Auto ingest: card insertion detected ({', '.join(sorted(new_drives))}).")
+            self._auto_pending = True
+            self.scan_source()
+        elif not self._busy:
+            # While busy the baseline stays put so an insertion lands after the current job.
+            self._known_drives = current
+
     def choose_destination(self):
         folder = QFileDialog.getExistingDirectory(self, "Select destination folder", self.destination_edit.text())
         if folder:
@@ -208,6 +229,7 @@ class QuickIngestWindow(QMainWindow):
         self.scanned_files = []
         self.ingest_button.setEnabled(False)
         self.scan_button.setEnabled(False)
+        self._busy = True
         self.summary_label.setText("Scanning files...")
         self.progress.setRange(0, 0)
         self.statusBar().showMessage("Scanning source card...")
@@ -234,6 +256,13 @@ class QuickIngestWindow(QMainWindow):
         self.statusBar().showMessage("Scan completed")
         self.scan_button.setEnabled(True)
         self.ingest_button.setEnabled(bool(files))
+        self._busy = False
+        if self._auto_pending:
+            self._auto_pending = False
+            if files:
+                self.start_ingest(confirm=False)
+            else:
+                self.append_log("Auto ingest: no matching files found.")
 
     def worker_failed(self, message: str):
         self.progress.setRange(0, 100)
@@ -243,9 +272,11 @@ class QuickIngestWindow(QMainWindow):
         self.statusBar().showMessage("Operation failed")
         self.scan_button.setEnabled(True)
         self.ingest_button.setEnabled(False)
+        self._busy = False
+        self._auto_pending = False
         QMessageBox.critical(self, "QuickIngest error", message)
 
-    def start_ingest(self):
+    def start_ingest(self, confirm: bool = True):
         card = self.selected_card()
         if not card or not self.scanned_files:
             QMessageBox.warning(self, "Nothing to ingest", "Scan files and select a camera card first.")
@@ -269,14 +300,15 @@ class QuickIngestWindow(QMainWindow):
             self.refresh_cards()
             return
 
-        answer = QMessageBox.question(
-            self, "Confirm ingest",
-            f"Copy {len(self.scanned_files):,} file(s) to:\n{destination}\n\nExisting files will not be overwritten.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
+        if confirm:
+            answer = QMessageBox.question(
+                self, "Confirm ingest",
+                f"Copy {len(self.scanned_files):,} file(s) to:\n{destination}\n\nExisting files will not be overwritten.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
 
         self.set_busy(True)
         self.progress.setRange(0, len(self.scanned_files))
@@ -312,6 +344,7 @@ class QuickIngestWindow(QMainWindow):
         self.ingest_button.setEnabled(False)
 
     def set_busy(self, busy: bool):
+        self._busy = busy
         self.scan_button.setEnabled(not busy)
         self.refresh_button.setEnabled(not busy)
         self.browse_button.setEnabled(not busy)
