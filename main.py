@@ -3,15 +3,18 @@
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, QTimer, Signal, Qt
+from PySide6.QtCore import QObject, QSettings, QThread, QTimer, Signal, Qt
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar,
-    QPushButton, QPlainTextEdit, QVBoxLayout, QWidget,
+    QPushButton, QPlainTextEdit, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from card_detector import find_camera_cards
-from ingest import copy_files, is_destination_inside_card
+from ingest import (
+    assign_sequence_names, copy_files, is_destination_inside_card, new_photos,
+    next_sequence_number, sanitize_prefix,
+)
 from lock_detector import scan_images
 
 
@@ -19,15 +22,19 @@ class ScanWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, dcim_path: Path, extensions: tuple[str, ...], protected_only: bool):
+    def __init__(self, dcim_path: Path, extensions: tuple[str, ...], protected_only: bool, destination: Path | None):
         super().__init__()
         self.dcim_path = dcim_path
         self.extensions = extensions
         self.protected_only = protected_only
+        self.destination = destination
 
     def run(self):
         try:
-            self.finished.emit(scan_images(self.dcim_path, self.extensions, self.protected_only))
+            files = scan_images(self.dcim_path, self.extensions, self.protected_only)
+            if self.destination is not None:
+                files = new_photos(files, self.destination)
+            self.finished.emit(files)
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -37,14 +44,15 @@ class IngestWorker(QObject):
     finished = Signal(int, int, int)
     failed = Signal(str)
 
-    def __init__(self, files: list[Path], destination: Path):
+    def __init__(self, files: list[Path], destination: Path, dest_names: list[str] | None = None):
         super().__init__()
         self.files = files
         self.destination = destination
+        self.dest_names = dest_names
 
     def run(self):
         try:
-            result = copy_files(self.files, self.destination, self.progress.emit)
+            result = copy_files(self.files, self.destination, self.progress.emit, self.dest_names)
             self.finished.emit(*result)
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -64,6 +72,8 @@ class QuickIngestWindow(QMainWindow):
         self._busy = False
         self._auto_pending = False
         self._known_drives: set[str] = set()
+        self._baseline_done = False
+        self.settings = QSettings("QuickIngest", "QuickIngest")
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -105,6 +115,22 @@ class QuickIngestWindow(QMainWindow):
         options_form.addRow("Selection", self.protected_check)
         self.auto_check = QCheckBox("Auto ingest when a card is inserted")
         options_form.addRow("Auto", self.auto_check)
+        rename_row = QHBoxLayout()
+        self.rename_check = QCheckBox("Rename to sequence")
+        self.prefix_edit = QLineEdit("ABC")
+        self.prefix_edit.setFixedWidth(80)
+        self.prefix_edit.setPlaceholderText("Prefix")
+        rename_row.addWidget(self.rename_check)
+        rename_row.addWidget(self.prefix_edit)
+        self.digits_spin = QSpinBox()
+        self.digits_spin.setRange(1, 9)
+        self.digits_spin.setValue(1)
+        rename_row.addWidget(self.digits_spin)
+        rename_row.addWidget(QLabel("digits"))
+        rename_row.addStretch(1)
+        self.next_label = QLabel("Next: —")
+        rename_row.addWidget(self.next_label)
+        options_form.addRow("Naming", rename_row)
         layout.addWidget(options_group)
 
         destination_group = QGroupBox("Destination")
@@ -144,12 +170,37 @@ class QuickIngestWindow(QMainWindow):
         preview_layout.addWidget(self.log, 1)
         layout.addWidget(preview_group, 1)
 
+        self.destination_edit.setText(self.settings.value("destination", self.destination_edit.text(), type=str))
+        self.prefix_edit.setText(self.settings.value("prefix", self.prefix_edit.text(), type=str))
+        self.digits_spin.setValue(self.settings.value("digits", self.digits_spin.value(), type=int))
+        self.rename_check.setChecked(self.settings.value("rename", False, type=bool))
+        self.auto_check.setChecked(self.settings.value("auto", False, type=bool))
+        self.protected_check.setChecked(self.settings.value("protected", True, type=bool))
+        self.arw_check.setChecked(self.settings.value("arw", True, type=bool))
+        self.jpg_check.setChecked(self.settings.value("jpg", True, type=bool))
+
         self.statusBar().showMessage("Ready")
+
+        self.prefix_edit.textChanged.connect(self.update_next_number)
+        self.digits_spin.valueChanged.connect(self.update_next_number)
+        self.destination_edit.textChanged.connect(self.update_next_number)
+        self.update_next_number()
 
         self.drive_timer = QTimer(self)
         self.drive_timer.timeout.connect(self.refresh_cards)
         self.drive_timer.start(2500)
         self.refresh_cards()
+
+    def closeEvent(self, event):
+        self.settings.setValue("destination", self.destination_edit.text())
+        self.settings.setValue("prefix", self.prefix_edit.text())
+        self.settings.setValue("digits", self.digits_spin.value())
+        self.settings.setValue("rename", self.rename_check.isChecked())
+        self.settings.setValue("auto", self.auto_check.isChecked())
+        self.settings.setValue("protected", self.protected_check.isChecked())
+        self.settings.setValue("arw", self.arw_check.isChecked())
+        self.settings.setValue("jpg", self.jpg_check.isChecked())
+        super().closeEvent(event)
 
     def append_log(self, message: str):
         self.log.appendPlainText(message)
@@ -183,7 +234,7 @@ class QuickIngestWindow(QMainWindow):
         current = {str(card["drive"]) for card in self.cards}
         new_drives = current - self._known_drives
         # shortcut: insertion noticed on the 2.5s drive poll (max ~2.5s late), upgrade to WM_DEVICECHANGE if that latency matters
-        if new_drives and self.auto_check.isChecked() and not self._busy:
+        if self._baseline_done and new_drives and self.auto_check.isChecked() and not self._busy:
             self._known_drives = current
             for index, card in enumerate(self.cards):
                 if str(card["drive"]) in new_drives:
@@ -193,13 +244,33 @@ class QuickIngestWindow(QMainWindow):
             self._auto_pending = True
             self.scan_source()
         elif not self._busy:
-            # While busy the baseline stays put so an insertion lands after the current job.
+            # First pass records the baseline (cards present at launch never auto-trigger); busy holds it so a pending insertion fires later.
             self._known_drives = current
+            self._baseline_done = True
 
     def choose_destination(self):
         folder = QFileDialog.getExistingDirectory(self, "Select destination folder", self.destination_edit.text())
         if folder:
             self.destination_edit.setText(folder)
+
+    def resolve_destination(self) -> Path | None:
+        raw = self.destination_edit.text().strip().strip('"')
+        if not raw:
+            return None
+        try:
+            return Path(raw).expanduser().resolve()
+        except OSError:
+            return None
+
+    def update_next_number(self):
+        # shortcut: one listdir per keystroke, debounce if a huge/network destination makes typing lag
+        prefix = sanitize_prefix(self.prefix_edit.text())
+        destination = self.resolve_destination()
+        if not prefix or destination is None:
+            self.next_label.setText("Next: —")
+            return
+        number = next_sequence_number(destination, prefix)
+        self.next_label.setText(f"Next: {prefix}_{number:0{self.digits_spin.value()}d}")
 
     def selected_card(self):
         drive = self.source_combo.currentData()
@@ -235,7 +306,9 @@ class QuickIngestWindow(QMainWindow):
         self.statusBar().showMessage("Scanning source card...")
 
         self.scan_thread = QThread(self)
-        self.scan_worker = ScanWorker(Path(card["dcim"]), tuple(extensions), self.protected_check.isChecked())
+        self.scan_worker = ScanWorker(
+            Path(card["dcim"]), tuple(extensions), self.protected_check.isChecked(), self.resolve_destination()
+        )
         self.scan_worker.moveToThread(self.scan_thread)
         self.scan_thread.started.connect(self.scan_worker.run)
         self.scan_worker.finished.connect(self.scan_finished)
@@ -251,8 +324,8 @@ class QuickIngestWindow(QMainWindow):
         self.progress.setValue(0)
         arw = sum(p.suffix.lower() == ".arw" for p in files)
         jpg = sum(p.suffix.lower() in {".jpg", ".jpeg"} for p in files)
-        self.summary_label.setText(f"Scan complete — {len(files):,} file(s) found\nARW: {arw:,}    JPG: {jpg:,}")
-        self.append_log(f"Scan complete: {len(files)} file(s) found.")
+        self.summary_label.setText(f"Scan complete — {len(files):,} new file(s)\nARW: {arw:,}    JPG: {jpg:,}")
+        self.append_log(f"Scan complete: {len(files)} new file(s) to ingest.")
         self.statusBar().showMessage("Scan completed")
         self.scan_button.setEnabled(True)
         self.ingest_button.setEnabled(bool(files))
@@ -274,6 +347,7 @@ class QuickIngestWindow(QMainWindow):
         self.ingest_button.setEnabled(False)
         self._busy = False
         self._auto_pending = False
+        self.update_next_number()
         QMessageBox.critical(self, "QuickIngest error", message)
 
     def start_ingest(self, confirm: bool = True):
@@ -300,10 +374,21 @@ class QuickIngestWindow(QMainWindow):
             self.refresh_cards()
             return
 
+        files = self.scanned_files.copy()
+        dest_names = None
+        rename_note = ""
+        if self.rename_check.isChecked():
+            prefix = sanitize_prefix(self.prefix_edit.text())
+            if not prefix:
+                QMessageBox.warning(self, "Invalid prefix", "Enter a prefix for the sequence names.")
+                return
+            dest_names = assign_sequence_names(files, destination, prefix, self.digits_spin.value())
+            rename_note = f"\nRenamed to {prefix}_n.*"
+
         if confirm:
             answer = QMessageBox.question(
                 self, "Confirm ingest",
-                f"Copy {len(self.scanned_files):,} file(s) to:\n{destination}\n\nExisting files will not be overwritten.",
+                f"Copy {len(files):,} file(s) to:\n{destination}{rename_note}\n\nExisting files will not be overwritten.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -317,7 +402,7 @@ class QuickIngestWindow(QMainWindow):
         self.append_log(f"Starting ingest to {destination}")
 
         self.ingest_thread = QThread(self)
-        self.ingest_worker = IngestWorker(self.scanned_files.copy(), destination)
+        self.ingest_worker = IngestWorker(files, destination, dest_names)
         self.ingest_worker.moveToThread(self.ingest_thread)
         self.ingest_thread.started.connect(self.ingest_worker.run)
         self.ingest_worker.progress.connect(self.ingest_progress)
@@ -342,6 +427,7 @@ class QuickIngestWindow(QMainWindow):
         self.append_log(f"Finished — copied {copied}, skipped {skipped}, errors {errors}.")
         self.statusBar().showMessage("Ingest completed")
         self.ingest_button.setEnabled(False)
+        self.update_next_number()
 
     def set_busy(self, busy: bool):
         self._busy = busy
@@ -352,6 +438,9 @@ class QuickIngestWindow(QMainWindow):
         self.arw_check.setEnabled(not busy)
         self.jpg_check.setEnabled(not busy)
         self.protected_check.setEnabled(not busy)
+        self.rename_check.setEnabled(not busy)
+        self.prefix_edit.setEnabled(not busy)
+        self.digits_spin.setEnabled(not busy)
         self.ingest_button.setEnabled(not busy and bool(self.scanned_files))
 
 
