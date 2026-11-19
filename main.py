@@ -16,6 +16,7 @@ from ingest import (
     next_sequence_number, sanitize_prefix,
 )
 from lock_detector import scan_images
+from unmount import unmount_drive
 
 
 class ScanWorker(QObject):
@@ -92,11 +93,16 @@ class QuickIngestWindow(QMainWindow):
         self.source_combo = QComboBox()
         self.refresh_button = QPushButton("Refresh")
         self.refresh_button.clicked.connect(self.refresh_cards)
+        self.unmount_button = QPushButton("Unmount")
+        self.unmount_button.clicked.connect(self.unmount_card)
         source_row.addWidget(self.source_combo, 1)
         source_row.addWidget(self.refresh_button)
+        source_row.addWidget(self.unmount_button)
         source_form.addRow("Camera card", source_row)
         self.card_status = QLabel("Searching for camera cards...")
         source_form.addRow("Status", self.card_status)
+        self.eject_check = QCheckBox("Unmount after ingest")
+        source_form.addRow("", self.eject_check)
         layout.addWidget(source_group)
 
         options_group = QGroupBox("Ingest options")
@@ -178,6 +184,7 @@ class QuickIngestWindow(QMainWindow):
         self.protected_check.setChecked(self.settings.value("protected", True, type=bool))
         self.arw_check.setChecked(self.settings.value("arw", True, type=bool))
         self.jpg_check.setChecked(self.settings.value("jpg", True, type=bool))
+        self.eject_check.setChecked(self.settings.value("eject", False, type=bool))
 
         self.statusBar().showMessage("Ready")
 
@@ -200,6 +207,7 @@ class QuickIngestWindow(QMainWindow):
         self.settings.setValue("protected", self.protected_check.isChecked())
         self.settings.setValue("arw", self.arw_check.isChecked())
         self.settings.setValue("jpg", self.jpg_check.isChecked())
+        self.settings.setValue("eject", self.eject_check.isChecked())
         super().closeEvent(event)
 
     def append_log(self, message: str):
@@ -229,7 +237,8 @@ class QuickIngestWindow(QMainWindow):
             self.card_status.setText(f"{len(self.cards)} camera card(s) detected")
         else:
             self.card_status.setText("No camera card found. Insert a card containing DCIM.")
-        self.scan_button.setEnabled(bool(self.cards))
+        self.scan_button.setEnabled(bool(self.cards) and not self._busy)
+        self.unmount_button.setEnabled(bool(self.cards) and not self._busy)
 
         current = {str(card["drive"]) for card in self.cards}
         new_drives = current - self._known_drives
@@ -279,6 +288,21 @@ class QuickIngestWindow(QMainWindow):
                 return card
         return None
 
+    def unmount_card(self):
+        card = self.selected_card()
+        if not card:
+            QMessageBox.warning(self, "No source", "Select a camera card first.")
+            return
+        try:
+            unmount_drive(Path(card["drive"]))
+        except OSError as exc:
+            self.append_log(f"ERROR: unmount failed — {exc}")
+            self.statusBar().showMessage("Unmount failed")
+            QMessageBox.critical(self, "Unmount failed", f"{exc}\n\nUse the Windows tray 'Safely Remove Hardware' instead.")
+            return
+        self.append_log(f"Unmounted {card['drive']} — safe to remove the card.")
+        self.statusBar().showMessage(f"Unmounted {card['drive']}")
+
     def scan_source(self):
         card = self.selected_card()
         if not card:
@@ -300,6 +324,7 @@ class QuickIngestWindow(QMainWindow):
         self.scanned_files = []
         self.ingest_button.setEnabled(False)
         self.scan_button.setEnabled(False)
+        self.unmount_button.setEnabled(False)
         self._busy = True
         self.summary_label.setText("Scanning files...")
         self.progress.setRange(0, 0)
@@ -328,6 +353,7 @@ class QuickIngestWindow(QMainWindow):
         self.append_log(f"Scan complete: {len(files)} new file(s) to ingest.")
         self.statusBar().showMessage("Scan completed")
         self.scan_button.setEnabled(True)
+        self.unmount_button.setEnabled(True)
         self.ingest_button.setEnabled(bool(files))
         self._busy = False
         if self._auto_pending:
@@ -344,6 +370,7 @@ class QuickIngestWindow(QMainWindow):
         self.append_log(f"ERROR: {message}")
         self.statusBar().showMessage("Operation failed")
         self.scan_button.setEnabled(True)
+        self.unmount_button.setEnabled(True)
         self.ingest_button.setEnabled(False)
         self._busy = False
         self._auto_pending = False
@@ -428,6 +455,11 @@ class QuickIngestWindow(QMainWindow):
         self.statusBar().showMessage("Ingest completed")
         self.ingest_button.setEnabled(False)
         self.update_next_number()
+        if self.eject_check.isChecked():
+            if errors == 0:
+                self.unmount_card()
+            else:
+                self.append_log("Auto-unmount skipped: ingest finished with errors.")
 
     def set_busy(self, busy: bool):
         self._busy = busy
@@ -441,6 +473,7 @@ class QuickIngestWindow(QMainWindow):
         self.rename_check.setEnabled(not busy)
         self.prefix_edit.setEnabled(not busy)
         self.digits_spin.setEnabled(not busy)
+        self.unmount_button.setEnabled(not busy)
         self.ingest_button.setEnabled(not busy and bool(self.scanned_files))
 
 
